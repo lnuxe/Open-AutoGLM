@@ -448,43 +448,54 @@ def _is_garbage_output(text: str) -> bool:
 
 def _extract_action_via_regex(text: str) -> dict[str, Any] | None:
     """Try to extract a valid do/finish action from text using regex fallback."""
-    # Try to find do(action=...) pattern
-    m = re.search(r'do\s*\(\s*action\s*=\s*"([^"]*)"\s*((?:,?\s*[a-zA-Z_]\w*\s*=\s*"[^"]*"\s*)*)\s*\)', text)
-    if m:
-        action_name = m.group(1)
-        kwargs_str = m.group(2).strip()
-        kwargs = _extract_kwargs(kwargs_str) if kwargs_str else {}
-        kwargs['action'] = action_name
-        kwargs['_metadata'] = 'do'
-        return kwargs
+    # Strategy: find the outermost do(...) or finish(...) call using balanced paren matching
+    for pattern, marker in [
+        (r'do\s*\(', 'do'),
+        (r'finish\s*\(', 'finish'),
+    ]:
+        for m in re.finditer(pattern, text):
+            start = m.start()
+            paren_start = text.index('(', m.start())
+            # Find matching closing paren (handle nested parens)
+            depth = 1
+            i = paren_start + 1
+            while i < len(text) and depth > 0:
+                if text[i] == '(':
+                    depth += 1
+                elif text[i] == ')':
+                    depth -= 1
+                i += 1
+            if depth == 0:
+                call_content = text[paren_start + 1:i - 1].strip()
+                if marker == 'do':
+                    kwargs = _extract_kwargs(call_content)
+                    if 'action' in kwargs:
+                        kwargs['_metadata'] = 'do'
+                        return kwargs
+                else:
+                    kwargs = _extract_kwargs(call_content)
+                    if 'message' in kwargs:
+                        kwargs['_metadata'] = 'finish'
+                        return kwargs
 
-    # Try to find finish(message=...) pattern
-    m = re.search(r'finish\s*\(\s*message\s*=\s*"((?:[^"\\]|\\.)*)"\s*\)', text)
+    # Fallback: Check for legacy <answer> format with JSON
+    m = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
     if m:
-        return {'_metadata': 'finish', 'message': m.group(1)}
-
-    # Try to find <answer>do(action=...) or <answer>finish(...) pattern
-    m = re.search(r'<answer>\s*do\s*\(\s*action\s*=\s*"([^"]*)"', text)
-    if m:
-        action_name = m.group(1)
-        kwargs = {'action': action_name, '_metadata': 'do'}
-        # Try to extract additional kwargs
-        rest = text[m.end():]
-        if 'text=' in rest:
-            tm = re.search(r'text\s*=\s*"((?:[^"\\]|\\.)*)"', rest)
-            if tm:
-                kwargs['text'] = tm.group(1)
-        # Check for legacy <answer> format with JSON
-        if m := re.search(r'<answer>(.*?)</answer>', text, re.DOTALL):
-            inner = m.group(1).strip()
-            try:
-                parsed = json.loads(inner)
-                if isinstance(parsed, dict):
-                    parsed['_metadata'] = 'do'
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-        return kwargs
+        inner = m.group(1).strip()
+        try:
+            parsed = json.loads(inner)
+            if isinstance(parsed, dict):
+                parsed['_metadata'] = 'do'
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        # Try to parse as do(action=...) inside <answer>
+        inner = inner.strip()
+        if inner.startswith('do(') and inner.endswith(')'):
+            kwargs = _extract_kwargs(inner[3:-1])
+            if 'action' in kwargs:
+                kwargs['_metadata'] = 'do'
+                return kwargs
 
     return None
 
