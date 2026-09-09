@@ -51,6 +51,7 @@ APP_PACKAGES: dict[str, str] = {
     # Productivity
     "飞书": "com.ss.android.lark",
     "QQ邮箱": "com.tencent.androidqqmail",
+    "企业微信": "com.tencent.wework",
     # AI & Tools
     "豆包": "com.larus.nova",
     # Health & Fitness
@@ -58,6 +59,8 @@ APP_PACKAGES: dict[str, str] = {
     "美柚": "com.lingan.seeyou",
     # News & Information
     "腾讯新闻": "com.tencent.news",
+    "心悦": "com.tencent.tgclub",
+    "心悦俱乐部": "com.tencent.tgclub",
     "今日头条": "com.ss.android.article.news",
     # Real Estate
     "贝壳找房": "com.lianjia.beike",

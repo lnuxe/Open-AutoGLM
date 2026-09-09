@@ -80,6 +80,8 @@ class PhoneAgent:
 
         self._context: list[dict[str, Any]] = []
         self._step_count = 0
+        self._action_history: list[dict[str, Any]] = []  # For loop detection
+        self._loop_break_count = 0  # How many times we've intervened to break a loop
 
     def run(self, task: str) -> str:
         """
@@ -132,6 +134,8 @@ class PhoneAgent:
         """Reset the agent state for a new task."""
         self._context = []
         self._step_count = 0
+        self._action_history = []
+        self._loop_break_count = 0
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False
@@ -172,7 +176,7 @@ class PhoneAgent:
         try:
             msgs = get_messages(self.agent_config.lang)
             print("\n" + "=" * 50)
-            print(f"💭 {msgs['thinking']}:")
+            print(f"\U0001f4ad {msgs['thinking']}:")
             print("-" * 50)
             response = self.model_client.request(self._context)
         except Exception as e:
@@ -190,14 +194,37 @@ class PhoneAgent:
         try:
             action = parse_action(response.action)
         except ValueError:
+            # Parse failed — don't immediately finish! Instead, log the error
+            # and ask the model to retry by injecting a hint into the context.
             if self.agent_config.verbose:
                 traceback.print_exc()
-            action = finish(message=response.action)
+            # Add a hint to the context so the model can retry
+            self._context.append(
+                MessageBuilder.create_assistant_message(
+                    f"思考{response.thinking} 回复<answer>{response.action}</answer>"
+                )
+            )
+            # Remove image from context to save space
+            self._context[-2] = MessageBuilder.remove_images_from_message(self._context[-2])
+            error_hint = (
+                "你上一步的输出格式有误，无法解析为有效的操作指令。\n"
+                "请严格按照以下格式输出，确保括号和引号完整匹配：\n"
+                "  do(action=\"操作名\", 参数名=\"参数值\")\n"
+                "或 finish(message=\"完成说明\")\n"
+                "注意：不要在 message 参数中使用未转义的双引号，如需要引号请使用「」代替。"
+            )
+            return StepResult(
+                success=False,
+                finished=False,
+                action=None,
+                thinking="",
+                message=error_hint,
+            )
 
         if self.agent_config.verbose:
             # Print thinking process
             print("-" * 50)
-            print(f"🎯 {msgs['action']}:")
+            print(f"\U0001f3af {msgs['action']}:")
             print(json.dumps(action, ensure_ascii=False, indent=2))
             print("=" * 50 + "\n")
 
@@ -219,18 +246,85 @@ class PhoneAgent:
         # Add assistant response to context
         self._context.append(
             MessageBuilder.create_assistant_message(
-                f"<think>{response.thinking}</think><answer>{response.action}</answer>"
+                f"思考{response.thinking} 回复<answer>{response.action}</answer>"
             )
         )
+
+        # Track action for loop detection (skip Note/Call_API/Wait since they don't change UI state)
+        if action.get("_metadata") == "do":
+            act_name = action.get("action")
+            if act_name not in ("Note", "Call_API", "Wait",):
+                sig = json.dumps(action, ensure_ascii=False, sort_keys=True)
+                self._action_history.append({"action": action, "signature": sig})
 
         # Check if finished
         finished = action.get("_metadata") == "finish" or result.should_finish
 
+        # --- Loop detection: if stuck in a loop, inject a hint into the next step ---
+        loop_detected = False
+        loop_hint = None
+        if not finished and len(self._action_history) >= 4:
+            recent = self._action_history[-6:]
+            sigs = [h["signature"] for h in recent]
+
+            # Detect repeated action (same action 3+ consecutive times)
+            for i in range(len(sigs) - 2):
+                if sigs[i] == sigs[i + 1] == sigs[i + 2]:
+                    loop_detected = True
+                    loop_hint = (
+                        "检测到你在重复执行相同的操作，这可能导致陷入循环。\n"
+                        "请尝试以下方法之一：\n"
+                        "1. 如果当前操作没有生效，请使用 Back 返回上一页，\n"
+                        "   然后尝试不同的路径。\n"
+                        "2. 如果页面内容没有变化，请尝试滑动页面看看是否有\n"
+                        "   更多内容。\n"
+                        "3. 如果确实找不到目标，请执行 finish(message=\"原因\")"
+                    )
+                    break
+
+            # Detect A-B-A-B ping-pong pattern
+            if not loop_detected and len(sigs) >= 4:
+                for i in range(len(sigs) - 3):
+                    if sigs[i] == sigs[i + 2] and sigs[i + 1] == sigs[i + 3] and sigs[i] != sigs[i + 1]:
+                        loop_detected = True
+                        loop_hint = (
+                            "检测到你在两个页面之间来回切换，这可能导致陷入循环。\n"
+                            "请尝试使用 Back 返回到之前的页面，然后尝试不同的路径。\n"
+                            "如果目标页面无法到达，请执行 finish(message=\"原因\")。"
+                        )
+                        break
+
+        if loop_detected:
+            self._loop_break_count += 1
+            if self.agent_config.verbose:
+                print(f"\n\U0001f504 检测到循环行为 (第{self._loop_break_count}次干预)，正在注入提示...")
+            # Replace the last assistant message to mark it as a failed attempt
+            self._context.pop()
+            self._context.append(
+                MessageBuilder.create_assistant_message(
+                    f"思考{response.thinking} 回复<answer>{response.action}</answer>"
+                )
+            )
+            # Inject user hint for the next step
+            self._context.append(
+                MessageBuilder.create_user_message(
+                    text=f"【系统提示】\n{loop_hint}",
+                    image_base64=None,
+                )
+            )
+            return StepResult(
+                success=False,
+                finished=False,
+                action=action,
+                thinking=response.thinking,
+                message="Loop detected, injected hint for next step",
+            )
+
         if finished and self.agent_config.verbose:
             msgs = get_messages(self.agent_config.lang)
-            print("\n" + "🎉 " + "=" * 48)
+            print("\n" + "\U0001f389 " + "=" * 48)
             print(
-                f"✅ {msgs['task_completed']}: {result.message or action.get('message', msgs['done'])}"
+                f"\u2705 {msgs['task_completed']}: {result.message or action.get('message', msgs['done'])}"
             )
             print("=" * 50 + "\n")
 

@@ -1,6 +1,5 @@
 """Action handler for processing AI model outputs."""
 
-import ast
 import re
 import subprocess
 import time
@@ -329,9 +328,109 @@ class ActionHandler:
         input(f"{message}\nPress Enter after completing manual operation...")
 
 
+def _extract_kwargs(text: str) -> dict[str, Any]:
+    """
+    Extract keyword arguments from a function call string using regex.
+    Handles multi-line strings, special characters, nested quotes, etc.
+
+    Parses: do(action="Tap", element=[x,y], message="text with \"quotes\"")
+    Parses: finish(message="done")
+    """
+    result: dict[str, Any] = {}
+    pos = 0
+    # Match key=value pairs, where value is a string, number, list, or boolean
+    while pos < len(text):
+        # Skip whitespace and commas
+        m = re.match(r'[\s,]*', text[pos:])
+        if m:
+            pos += m.end()
+
+        if pos >= len(text):
+            break
+
+        # Match key name
+        m = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*', text[pos:])
+        if not m:
+            break
+        key = m.group(1)
+        pos += m.end()
+
+        # Parse value based on first character
+        if pos < len(text) and text[pos] == '"':
+            # Double-quoted string - handle escapes
+            pos += 1
+            val_chars: list[str] = []
+            while pos < len(text):
+                ch = text[pos]
+                if ch == '\\' and pos + 1 < len(text):
+                    val_chars.append(text[pos + 1])
+                    pos += 2
+                elif ch == '"':
+                    pos += 1
+                    break
+                else:
+                    val_chars.append(ch)
+                    pos += 1
+            result[key] = ''.join(val_chars)
+
+        elif pos < len(text) and text[pos] == "'":
+            # Single-quoted string
+            pos += 1
+            val_chars: list[str] = []
+            while pos < len(text):
+                ch = text[pos]
+                if ch == '\\' and pos + 1 < len(text):
+                    val_chars.append(text[pos + 1])
+                    pos += 2
+                elif ch == "'":
+                    pos += 1
+                    break
+                else:
+                    val_chars.append(ch)
+                    pos += 1
+            result[key] = ''.join(val_chars)
+
+        elif pos < len(text) and text[pos] == '[':
+            # List value [x, y]
+            pos += 1
+            nums: list[int] = []
+            while pos < len(text):
+                m = re.match(r'[\s,]*(\d+)[\s,]*', text[pos:])
+                if m:
+                    nums.append(int(m.group(1)))
+                    pos += m.end()
+                elif text[pos] == ']':
+                    pos += 1
+                    break
+                else:
+                    pos += 1
+            result[key] = nums
+
+        elif pos < len(text) and text[pos].isdigit() or (pos + 1 < len(text) and text[pos] == '-' and text[pos+1].isdigit()):
+            # Number
+            m = re.match(r'-?\d+(?:\.\d+)?', text[pos:])
+            if m:
+                val_str = m.group()
+                result[key] = int(val_str) if '.' not in val_str else float(val_str)
+                pos += m.end()
+
+        elif text[pos:pos+4].lower() == 'true':
+            result[key] = True
+            pos += 4
+        elif text[pos:pos+5].lower() == 'false':
+            result[key] = False
+            pos += 5
+
+        elif text[pos] == ')':
+            break
+
+    return result
+
+
 def parse_action(response: str) -> dict[str, Any]:
     """
-    Parse action from model response.
+    Parse action from model response using regex-based parsing.
+    Robust against multi-line strings, full-width quotes, and special characters.
 
     Args:
         response: Raw response string from the model.
@@ -342,49 +441,70 @@ def parse_action(response: str) -> dict[str, Any]:
     Raises:
         ValueError: If the response cannot be parsed.
     """
-    print(f"Parsing action: {response}")
-    try:
-        response = response.strip()
-        if response.startswith('do(action="Type"') or response.startswith(
-            'do(action="Type_Name"'
-        ):
-            text = response.split("text=", 1)[1][1:-2]
+    response = response.strip()
+
+    # Normalize: collapse literal newlines/tabs inside the call (keep whitespace)
+    # We need to preserve spaces but remove actual newline characters within the call
+    in_string = False
+    string_char = None
+    escaped = False
+    normalized = []
+    for ch in response:
+        if escaped:
+            normalized.append(ch)
+            escaped = False
+            continue
+        if ch == '\\':
+            normalized.append(ch)
+            escaped = True
+            continue
+        if ch in ('"', "'"):
+            if in_string:
+                if ch == string_char:
+                    in_string = False
+            else:
+                in_string = True
+                string_char = ch
+            normalized.append(ch)
+            continue
+        if not in_string and ch in '\n\r\t':
+            normalized.append(' ')
+        else:
+            normalized.append(ch)
+    cleaned = ''.join(normalized)
+
+    if cleaned.startswith('do(action="Type"') or cleaned.startswith('do(action="Type_Name"'):
+        # Extract text after 'text=' using regex
+        m = re.search(r'text\s*=\s*"((?:[^"\\]|\\.)*)"', cleaned)
+        if m:
+            text = m.group(1)
             action = {"_metadata": "do", "action": "Type", "text": text}
             return action
-        elif response.startswith("do"):
-            # Use AST parsing instead of eval for safety
-            try:
-                # Escape special characters (newlines, tabs, etc.) for valid Python syntax
-                response = response.replace('\n', '\\n')
-                response = response.replace('\r', '\\r')
-                response = response.replace('\t', '\\t')
 
-                tree = ast.parse(response, mode="eval")
-                if not isinstance(tree.body, ast.Call):
-                    raise ValueError("Expected a function call")
+    if cleaned.startswith('do('):
+        # Extract the inner content between do(...)
+        inner = cleaned[3:].strip()
+        if inner.startswith('(') and inner.endswith(')'):
+            inner = inner[1:-1]
+        elif inner.endswith(')'):
+            inner = inner[:-1]
+        kwargs = _extract_kwargs(inner)
+        if 'action' not in kwargs:
+            raise ValueError(f"Missing 'action' key in do(): {response[:200]}")
+        kwargs['_metadata'] = 'do'
+        return kwargs
 
-                call = tree.body
-                # Extract keyword arguments safely
-                action = {"_metadata": "do"}
-                for keyword in call.keywords:
-                    key = keyword.arg
-                    value = ast.literal_eval(keyword.value)
-                    action[key] = value
+    if cleaned.startswith('finish('):
+        inner = cleaned[7:].strip()
+        if inner.startswith('(') and inner.endswith(')'):
+            inner = inner[1:-1]
+        elif inner.endswith(')'):
+            inner = inner[:-1]
+        kwargs = _extract_kwargs(inner)
+        kwargs['_metadata'] = 'finish'
+        return kwargs
 
-                return action
-            except (SyntaxError, ValueError) as e:
-                raise ValueError(f"Failed to parse do() action: {e}")
-
-        elif response.startswith("finish"):
-            action = {
-                "_metadata": "finish",
-                "message": response.replace("finish(message=", "")[1:-2],
-            }
-        else:
-            raise ValueError(f"Failed to parse action: {response}")
-        return action
-    except Exception as e:
-        raise ValueError(f"Failed to parse action: {e}")
+    raise ValueError(f"Failed to parse action: {response[:200]}")
 
 
 def do(**kwargs) -> dict[str, Any]:
