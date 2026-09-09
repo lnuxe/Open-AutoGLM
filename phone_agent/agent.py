@@ -82,6 +82,7 @@ class PhoneAgent:
         self._step_count = 0
         self._action_history: list[dict[str, Any]] = []  # For loop detection
         self._loop_break_count = 0  # How many times we've intervened to break a loop
+        self._parse_retry_count = 0  # Consecutive parse failures for current step
 
     def run(self, task: str) -> str:
         """
@@ -136,6 +137,7 @@ class PhoneAgent:
         self._step_count = 0
         self._action_history = []
         self._loop_break_count = 0
+        self._parse_retry_count = 0
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False
@@ -193,9 +195,25 @@ class PhoneAgent:
         # Parse action from response
         try:
             action = parse_action(response.action)
+            # Reset retry counter on success
+            self._parse_retry_count = 0
         except ValueError:
             # Parse failed — don't immediately finish! Instead, log the error
             # and ask the model to retry by injecting a hint into the context.
+            self._parse_retry_count += 1
+            MAX_PARSE_RETRIES = 3
+            if self._parse_retry_count >= MAX_PARSE_RETRIES:
+                # Too many consecutive parse failures — force-finish
+                if self.agent_config.verbose:
+                    traceback.print_exc()
+                return StepResult(
+                    success=False,
+                    finished=True,
+                    action=None,
+                    thinking="",
+                    message=f"模型连续 {MAX_PARSE_RETRIES} 次输出格式错误，无法解析为有效操作指令。"
+                            f"最后一次输出: {response.action[:200]}",
+                )
             if self.agent_config.verbose:
                 traceback.print_exc()
             # Add a hint to the context so the model can retry

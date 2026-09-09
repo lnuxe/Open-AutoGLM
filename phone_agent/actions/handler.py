@@ -1,5 +1,6 @@
 """Action handler for processing AI model outputs."""
 
+import json
 import re
 import subprocess
 import time
@@ -427,6 +428,67 @@ def _extract_kwargs(text: str) -> dict[str, Any]:
     return result
 
 
+def _is_garbage_output(text: str) -> bool:
+    """Detect if the output is garbage (repetitive chars, no valid action markers)."""
+    if not text or len(text) < 5:
+        return True
+    # Check for repetitive single character patterns (e.g., "思考思考思考思考...")
+    # Count unique characters
+    unique_chars = len(set(text))
+    if len(text) >= 20 and unique_chars <= 3:
+        return True
+    # Check if common Chinese repetition chars dominate
+    # 思考, 等, 等等
+    rep_chars = ['思', '考', '等', '。', '，', ' ', '\n']
+    rep_count = sum(1 for c in text if c in rep_chars)
+    if len(text) >= 20 and rep_count / len(text) > 0.7:
+        return True
+    return False
+
+
+def _extract_action_via_regex(text: str) -> dict[str, Any] | None:
+    """Try to extract a valid do/finish action from text using regex fallback."""
+    # Try to find do(action=...) pattern
+    m = re.search(r'do\s*\(\s*action\s*=\s*"([^"]*)"\s*((?:,?\s*[a-zA-Z_]\w*\s*=\s*"[^"]*"\s*)*)\s*\)', text)
+    if m:
+        action_name = m.group(1)
+        kwargs_str = m.group(2).strip()
+        kwargs = _extract_kwargs(kwargs_str) if kwargs_str else {}
+        kwargs['action'] = action_name
+        kwargs['_metadata'] = 'do'
+        return kwargs
+
+    # Try to find finish(message=...) pattern
+    m = re.search(r'finish\s*\(\s*message\s*=\s*"((?:[^"\\]|\\.)*)"\s*\)', text)
+    if m:
+        return {'_metadata': 'finish', 'message': m.group(1)}
+
+    # Try to find <answer>do(action=...) or <answer>finish(...) pattern
+    m = re.search(r'<answer>\s*do\s*\(\s*action\s*=\s*"([^"]*)"', text)
+    if m:
+        action_name = m.group(1)
+        kwargs = {'action': action_name, '_metadata': 'do'}
+        # Try to extract additional kwargs
+        rest = text[m.end():]
+        if 'text=' in rest:
+            tm = re.search(r'text\s*=\s*"((?:[^"\\]|\\.)*)"', rest)
+            if tm:
+                kwargs['text'] = tm.group(1)
+        # Check for legacy <answer> format with JSON
+        if m := re.search(r'<answer>(.*?)</answer>', text, re.DOTALL):
+            inner = m.group(1).strip()
+            try:
+                parsed = json.loads(inner)
+                if isinstance(parsed, dict):
+                    parsed['_metadata'] = 'do'
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return kwargs
+
+    return None
+
+
 def parse_action(response: str) -> dict[str, Any]:
     """
     Parse action from model response using regex-based parsing.
@@ -443,8 +505,17 @@ def parse_action(response: str) -> dict[str, Any]:
     """
     response = response.strip()
 
+    # Step 1: Detect garbage output early
+    if _is_garbage_output(response):
+        # Try regex fallback first
+        fallback = _extract_action_via_regex(response)
+        if fallback:
+            return fallback
+        raise ValueError(
+            f"Garbage output detected (no valid action pattern): {response[:100]}"
+        )
+
     # Normalize: collapse literal newlines/tabs inside the call (keep whitespace)
-    # We need to preserve spaces but remove actual newline characters within the call
     in_string = False
     string_char = None
     escaped = False
@@ -503,6 +574,11 @@ def parse_action(response: str) -> dict[str, Any]:
         kwargs = _extract_kwargs(inner)
         kwargs['_metadata'] = 'finish'
         return kwargs
+
+    # Step 3: Try regex fallback for non-standard formats
+    fallback = _extract_action_via_regex(response)
+    if fallback:
+        return fallback
 
     raise ValueError(f"Failed to parse action: {response[:200]}")
 
